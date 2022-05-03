@@ -14,21 +14,37 @@ import (
 )
 
 var (
-	mu      sync.Mutex
-	mixer   beep.Mixer
-	samples [][2]float64
-	context *malgo.AllocatedContext
-	player  *malgo.Device
-	done    chan struct{}
-	buf     []byte
+	mu           sync.Mutex
+	mixer        beep.Mixer
+	samples      [][2]float64
+	context      *malgo.AllocatedContext
+	playerDevice PlaybackDevice = PlaybackDevice{info: malgo.DeviceInfo{}, Name: "default"}
+	player       *malgo.Device
+	done         chan struct{}
+	buf          []byte
 )
 
-type SpeakerDevice struct {
+type PlaybackDevice struct {
 	info malgo.DeviceInfo
 	Name string
 }
 
-type chooseDeviceCB func(deviceList []SpeakerDevice) *SpeakerDevice
+func (sd *PlaybackDevice) IsDefault() bool {
+	return sd.info.IsDefault != 0
+}
+
+func init() {
+	var err error
+	context, err = malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
+		fmt.Printf("LOG <%v>\n", message)
+	})
+	errMsg := errors.Wrap(err, "failed to initialize speaker (context)")
+	if errMsg != nil {
+		panic(errMsg)
+	}
+}
+
+type chooseDeviceCB func(deviceList []PlaybackDevice) *PlaybackDevice
 
 // Init initializes audio playback through speaker. Must be called before using this package.
 //
@@ -36,12 +52,37 @@ type chooseDeviceCB func(deviceList []SpeakerDevice) *SpeakerDevice
 // bufferSize means lower CPU usage and more reliable playback. Lower bufferSize means better
 // responsiveness and less delay.
 func Init(sampleRate beep.SampleRate, bufferSize int) error {
+	fmt.Println("using malgo")
 	return InitDeviceSelection(sampleRate, bufferSize, nil)
+}
+
+func GetPlaybackDevices() ([]PlaybackDevice, error) {
+	playbackDevices, err := context.Devices(malgo.Playback)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to get playback device list (enumeration)")
+	}
+	playbackList := []PlaybackDevice{}
+	for _, device := range playbackDevices {
+		playbackList = append(playbackList, PlaybackDevice{device, device.Name()})
+	}
+	return playbackList, nil
+}
+
+func SetPlaybackDevice(device PlaybackDevice) {
+	playerDevice = device
 }
 
 func configure(sampleRate beep.SampleRate, cb chooseDeviceCB) (malgo.DeviceConfig, error) {
 
-	deviceConfig := malgo.DefaultDeviceConfig(malgo.Playback)
+	emptyInfo := malgo.DeviceInfo{}
+	var deviceConfig malgo.DeviceConfig
+	if playerDevice.Name == "default" && playerDevice.info == emptyInfo {
+		deviceConfig = malgo.DefaultDeviceConfig(malgo.Playback)
+	} else {
+		deviceConfig = malgo.DeviceConfig{}
+		deviceConfig.DeviceType = malgo.Playback
+		deviceConfig.Playback.DeviceID = playerDevice.info.ID.Pointer()
+	}
 	deviceConfig.Playback.Format = malgo.FormatS16
 	deviceConfig.Playback.Channels = 2 //channels
 	deviceConfig.SampleRate = uint32(sampleRate)
@@ -52,9 +93,9 @@ func configure(sampleRate beep.SampleRate, cb chooseDeviceCB) (malgo.DeviceConfi
 		if err != nil {
 			return malgo.DeviceConfig{}, err
 		}
-		speakerList := []SpeakerDevice{}
+		speakerList := []PlaybackDevice{}
 		for _, device := range playbackDevices {
-			speakerList = append(speakerList, SpeakerDevice{device, device.Name()})
+			speakerList = append(speakerList, PlaybackDevice{device, device.Name()})
 		}
 		ret := cb(speakerList)
 		if ret != nil {
@@ -75,14 +116,6 @@ func InitDeviceSelection(sampleRate beep.SampleRate, bufferSize int, cb chooseDe
 	samples = make([][2]float64, bufferSize)
 
 	var err error
-	context, err = malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
-		fmt.Printf("LOG <%v>\n", message)
-	})
-
-	if err != nil {
-		return errors.Wrap(err, "failed to initialize speaker (context)")
-	}
-
 	var deviceConfig malgo.DeviceConfig
 	deviceConfig, err = configure(sampleRate, cb)
 	if err != nil {
