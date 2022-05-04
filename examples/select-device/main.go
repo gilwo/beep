@@ -40,13 +40,13 @@ func main() {
 	for _, e := range list {
 		fmt.Println(e.Name, "default:", e.IsDefault())
 	}
-	deviceSelect := func(deviceList []speaker.PlaybackDevice) *speaker.PlaybackDevice {
+	deviceSelect := func(deviceList []speaker.PlaybackDeviceInfo) *speaker.PlaybackDeviceInfo {
 		for {
 			fmt.Printf("choose a device from the list: (hitting enter without choosing will choose the default device)\n")
 			defaultIndex := 0
 			for i, d := range deviceList {
 				fmt.Printf("%d: %s%s\n", i+1, d.Name,
-					func(pd speaker.PlaybackDevice) string {
+					func(pd speaker.PlaybackDeviceInfo) string {
 						if pd.IsDefault() {
 							defaultIndex = i
 							return " (DEFAULT)"

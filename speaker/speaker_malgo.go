@@ -6,30 +6,33 @@ package speaker
 
 import (
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/faiface/beep"
 	"github.com/gen2brain/malgo"
+	"github.com/glycerine/rbuf"
 	"github.com/pkg/errors"
+	"github.com/sheerun/queue"
 )
 
 var (
-	mu           sync.Mutex
-	mixer        beep.Mixer
-	samples      [][2]float64
-	context      *malgo.AllocatedContext
-	playerDevice PlaybackDevice = PlaybackDevice{info: malgo.DeviceInfo{}, Name: "default"}
-	player       *malgo.Device
-	done         chan struct{}
-	buf          []byte
+	mu               sync.Mutex
+	mixer            beep.Mixer
+	samples          [][2]float64
+	context          *malgo.AllocatedContext
+	playerDeviceInfo PlaybackDeviceInfo = PlaybackDeviceInfo{info: malgo.DeviceInfo{}, Name: "default"}
+	player           *malgo.Device
+	done             chan struct{}
+	buf              []byte
 )
 
-type PlaybackDevice struct {
+type PlaybackDeviceInfo struct {
 	info malgo.DeviceInfo
 	Name string
 }
 
-func (sd *PlaybackDevice) IsDefault() bool {
+func (sd *PlaybackDeviceInfo) IsDefault() bool {
 	return sd.info.IsDefault != 0
 }
 
@@ -44,7 +47,7 @@ func init() {
 	}
 }
 
-type chooseDeviceCB func(deviceList []PlaybackDevice) *PlaybackDevice
+type chooseDeviceCB func(deviceList []PlaybackDeviceInfo) *PlaybackDeviceInfo
 
 // Init initializes audio playback through speaker. Must be called before using this package.
 //
@@ -56,32 +59,32 @@ func Init(sampleRate beep.SampleRate, bufferSize int) error {
 	return InitDeviceSelection(sampleRate, bufferSize, nil)
 }
 
-func GetPlaybackDevices() ([]PlaybackDevice, error) {
+func GetPlaybackDevices() ([]PlaybackDeviceInfo, error) {
 	playbackDevices, err := context.Devices(malgo.Playback)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to get playback device list (enumeration)")
 	}
-	playbackList := []PlaybackDevice{}
+	playbackList := []PlaybackDeviceInfo{}
 	for _, device := range playbackDevices {
-		playbackList = append(playbackList, PlaybackDevice{device, device.Name()})
+		playbackList = append(playbackList, PlaybackDeviceInfo{device, device.Name()})
 	}
 	return playbackList, nil
 }
 
-func SetPlaybackDevice(device PlaybackDevice) {
-	playerDevice = device
+func SetPlaybackDevice(device PlaybackDeviceInfo) {
+	playerDeviceInfo = device
 }
 
 func configure(sampleRate beep.SampleRate, cb chooseDeviceCB) (malgo.DeviceConfig, error) {
 
 	emptyInfo := malgo.DeviceInfo{}
 	var deviceConfig malgo.DeviceConfig
-	if playerDevice.Name == "default" && playerDevice.info == emptyInfo {
+	if playerDeviceInfo.Name == "default" && playerDeviceInfo.info == emptyInfo {
 		deviceConfig = malgo.DefaultDeviceConfig(malgo.Playback)
 	} else {
 		deviceConfig = malgo.DeviceConfig{}
 		deviceConfig.DeviceType = malgo.Playback
-		deviceConfig.Playback.DeviceID = playerDevice.info.ID.Pointer()
+		deviceConfig.Playback.DeviceID = playerDeviceInfo.info.ID.Pointer()
 	}
 	deviceConfig.Playback.Format = malgo.FormatS16
 	deviceConfig.Playback.Channels = 2 //channels
@@ -93,9 +96,9 @@ func configure(sampleRate beep.SampleRate, cb chooseDeviceCB) (malgo.DeviceConfi
 		if err != nil {
 			return malgo.DeviceConfig{}, err
 		}
-		speakerList := []PlaybackDevice{}
+		speakerList := []PlaybackDeviceInfo{}
 		for _, device := range playbackDevices {
-			speakerList = append(speakerList, PlaybackDevice{device, device.Name()})
+			speakerList = append(speakerList, PlaybackDeviceInfo{device, device.Name()})
 		}
 		ret := cb(speakerList)
 		if ret != nil {
@@ -133,6 +136,9 @@ func InitDeviceSelection(sampleRate beep.SampleRate, bufferSize int, cb chooseDe
 
 	deviceCallbacks := malgo.DeviceCallbacks{
 		Data: onSamples,
+		Stop: func() {
+			log.Println("stop playback device requested")
+		},
 	}
 	player, err = malgo.InitDevice(context.Context, deviceConfig, deviceCallbacks)
 	if err != nil {
@@ -172,7 +178,6 @@ func Close() {
 		}
 		player.Stop()
 		player.Uninit()
-		context.Uninit()
 		player = nil
 	}
 }
@@ -226,4 +231,254 @@ func update() {
 			buf = append(buf, low, high)
 		}
 	}
+}
+
+func DefaultCaptureDevice() CaptureDeviceInfo {
+	return CaptureDeviceInfo{
+		Name: "default",
+		info: malgo.DeviceInfo{},
+	}
+}
+
+func configureCapture(sampleRate beep.SampleRate, device CaptureDeviceInfo, numChannels int) malgo.DeviceConfig {
+	emptyInfo := malgo.DeviceInfo{}
+	var deviceConfig malgo.DeviceConfig
+	if device.Name == "default" && device.info == emptyInfo {
+		deviceConfig = malgo.DefaultDeviceConfig(malgo.Capture)
+	} else {
+		deviceConfig = malgo.DeviceConfig{}
+		deviceConfig.DeviceType = malgo.Capture
+		deviceConfig.Capture.DeviceID = device.info.ID.Pointer()
+	}
+	deviceConfig.Capture.Format = malgo.FormatS16
+	deviceConfig.Capture.Channels = uint32(numChannels)
+	deviceConfig.SampleRate = uint32(sampleRate)
+	deviceConfig.Alsa.NoMMap = 1
+	return deviceConfig
+}
+
+type CaptureDeviceInfo struct {
+	info malgo.DeviceInfo
+	Name string
+}
+
+func (sd *CaptureDeviceInfo) IsDefault() bool {
+	return sd.info.IsDefault != 0
+}
+
+type deviceCapture struct {
+	device *malgo.Device
+	rbuf   *rbuf.FixedSizeRingBuf
+	buf    []byte
+	bchan  chan (byte)
+	q      *queue.Queue
+	mode   int // 1 - ring buf, 2 - channel, 3 - q buf
+	ready  chan (struct{})
+	more   bool
+}
+
+// Creates a streamer which will stream audio from a capture device
+// sampleRate - ....
+// buf - ...
+func DeviceCapture(sr beep.SampleRate, device CaptureDeviceInfo, bufferSize int, numChannels int) (beep.Streamer, error) {
+	deviceConfig := configureCapture(sr, device, numChannels)
+
+	capture := &deviceCapture{
+		rbuf:  rbuf.NewFixedSizeRingBuf(bufferSize * numChannels),
+		buf:   make([]byte, bufferSize*numChannels, bufferSize*numChannels),
+		bchan: make(chan byte),
+		q:     queue.New(),
+		mode:  1,
+		ready: make(chan struct{}),
+		more:  false,
+	}
+
+	onCapSamples := func(pOutputSample, pInputSamples []byte, framecount uint32) {
+		byteCount := framecount * deviceConfig.Capture.Channels * uint32(malgo.SampleSizeInBytes(deviceConfig.Capture.Format))
+
+		if capture.mode == 1 {
+			_, err := capture.rbuf.WriteAndMaybeOverwriteOldestData(pInputSamples[:byteCount])
+			if err != nil {
+				panic(err)
+			}
+			if capture.more {
+				capture.more = false
+				capture.ready <- struct{}{}
+			}
+		} else if capture.mode == 2 {
+			for i := uint32(0); i < byteCount; i++ {
+				capture.bchan <- pInputSamples[i]
+			}
+		} else if capture.mode == 3 {
+			for _, b := range pInputSamples {
+				capture.q.Append(b)
+			}
+		}
+		// if len(buf) < int(byteCount) {
+		// 	update()
+		// }
+		// copy(pOutputSample, buf[:byteCount])
+		// buf = append([]byte{}, buf[byteCount:]...)
+	}
+
+	deviceCallbacks := malgo.DeviceCallbacks{
+		Data: onCapSamples,
+		Stop: func() {
+			log.Println("stop capture device requested")
+		},
+	}
+	var err error
+	capture.device, err = malgo.InitDevice(context.Context, deviceConfig, deviceCallbacks)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to initialize capture (device)")
+	}
+
+	err = capture.device.Start()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to initialize capture (device start)")
+	}
+
+	return capture, nil
+}
+
+func (g *deviceCapture) Stream(samples [][2]float64) (n int, ok bool) {
+	if g.mode == 1 {
+		samplesSize := int(g.device.CaptureChannels()) * len(samples) * malgo.SampleSizeInBytes(g.device.CaptureFormat())
+		buf := make([]byte, samplesSize, samplesSize)
+
+		if g.rbuf.Avail() == 0 {
+			g.more = true
+			<-g.ready
+		}
+
+		// log.Println("rbuf available:", avail)
+		var err error
+		var readCount int
+		// for {
+		// 	readCount, err = g.rbuf.ReadAndMaybeAdvance(buf, true)
+		// 	if err != nil {
+		// 		// panic(err)
+		// 		// log.Println(err)
+		// 	}
+		// 	if readCount == 0 {
+		// 		// log.Println("read count from rbuf is 0!!")
+		// 		g.more = true
+		// 		<-g.ready
+		// 		// log.Println("got more")
+		// 		continue
+		// 	}
+		// 	break
+		// }
+		readCount, err = g.rbuf.ReadAndMaybeAdvance(buf, true)
+		if err != nil {
+			// panic(err)
+			log.Println(err)
+		}
+
+		sampleLen := len(samples)
+		count := sampleLen
+		actLen := sampleLen
+		if readCount < sampleLen {
+			actLen = readCount
+			count = readCount
+		}
+		if g.device.CaptureChannels() == 1 {
+			for i := range samples {
+				e1 := buf[i*2]
+				e2 := buf[i*2+1]
+				val := float64(int16(e1)+int16(e2)*(1<<8)) / (1<<16 - 1)
+				samples[i][0] = val
+				samples[i][1] = val
+				count -= 1
+				if count == 0 {
+					break
+				}
+			}
+			return actLen, true
+		} else if g.device.CaptureChannels() == 2 {
+			for i := range samples {
+				e1 := buf[i*4]
+				e2 := buf[i*4+1]
+				e3 := buf[i*4+1]
+				e4 := buf[i*4+1]
+				val1 := float64(int16(e1)+int16(e2)*(1<<8)) / (1<<16 - 1)
+				val2 := float64(int16(e3)+int16(e4)*(1<<8)) / (1<<16 - 1)
+				samples[i][0] = val1
+				samples[i][1] = val2
+				count -= 1
+				if count == 0 {
+					break
+				}
+			}
+			return actLen, true
+		}
+	} else if g.mode == 2 {
+		for i := range samples {
+			e1 := <-g.bchan
+			e2 := <-g.bchan
+			val := float64(int16(e1)+int16(e2)*(1<<8)) / (1<<16 - 1)
+			samples[i][0] = val
+			samples[i][1] = val
+		}
+		return len(samples), true
+	} else if g.mode == 3 {
+		samplesLen := len(samples)
+		// fmt.Println("in custom class streamer cons func", samplesLen)
+		count := samplesLen
+		dataLen := 0
+		dataLen = g.q.Length()
+		actLen := samplesLen
+		if dataLen < samplesLen {
+			// fmt.Println("not enough data ready", dataLen)
+			if dataLen == 0 {
+				fmt.Printf("not enough %d of %d\n", dataLen, samplesLen)
+				return 0, true
+			}
+			count = dataLen
+			actLen = dataLen
+		}
+		for i := range samples {
+			var e1, e2 byte
+			e1 = g.q.Pop().(uint8)
+			e2 = g.q.Pop().(uint8)
+			val := float64(int16(e1)+int16(e2)*(1<<8)) / (1<<16 - 1)
+			samples[i][0] = val
+			samples[i][1] = val
+			count -= 1
+			if count == 0 {
+				break
+			}
+			// fmt.Println("return", actLen)
+			return actLen, true
+		}
+	}
+	// for i := range samples {
+	// 	// if g.t < 0.5 {
+	// 	// 	samples[i][0] = 2.0*(1-g.t) - 1
+	// 	// 	samples[i][1] = 2.0*(1-g.t) - 1
+	// 	// } else {
+	// 	// 	samples[i][0] = 2.0*g.t - 1.0
+	// 	// 	samples[i][1] = 2.0*g.t - 1.0
+	// 	// }
+	// 	// _, g.t = math.Modf(g.t + g.dt)
+	// }
+
+	panic("we should not reach here!!")
+	return len(samples), true
+}
+
+func (*deviceCapture) Err() error {
+	return nil
+}
+
+func GetCaptureDevices() ([]CaptureDeviceInfo, error) {
+	captureDevices, err := context.Devices(malgo.Capture)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to get capture device list (enumeration)")
+	}
+	captureList := []CaptureDeviceInfo{}
+	for _, device := range captureDevices {
+		captureList = append(captureList, CaptureDeviceInfo{device, device.Name()})
+	}
+	return captureList, nil
 }
