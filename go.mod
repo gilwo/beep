@@ -3,8 +3,10 @@ module github.com/faiface/beep
 go 1.14
 
 require (
-	github.com/gdamore/tcell v1.3.0
 	github.com/gen2brain/malgo v0.10.35
+	github.com/glycerine/goconvey v0.0.0-20190410193231-58a59202ab31 // indirect
+	github.com/glycerine/rbuf v0.0.0-20190314090850-75b78581bebe
+	github.com/gopherjs/gopherjs v1.17.2 // indirect
 	github.com/hajimehoshi/go-mp3 v0.3.0
 	github.com/hajimehoshi/oto v0.7.1
 	github.com/jfreymuth/oggvorbis v1.0.1
