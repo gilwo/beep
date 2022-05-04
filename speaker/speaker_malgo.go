@@ -13,7 +13,6 @@ import (
 	"github.com/gen2brain/malgo"
 	"github.com/glycerine/rbuf"
 	"github.com/pkg/errors"
-	"github.com/sheerun/queue"
 )
 
 var (
@@ -270,9 +269,6 @@ type deviceCapture struct {
 	device *malgo.Device
 	rbuf   *rbuf.FixedSizeRingBuf
 	buf    []byte
-	bchan  chan (byte)
-	q      *queue.Queue
-	mode   int // 1 - ring buf, 2 - channel, 3 - q buf
 	ready  chan (struct{})
 	more   bool
 }
@@ -286,9 +282,6 @@ func DeviceCapture(sr beep.SampleRate, device CaptureDeviceInfo, bufferSize int,
 	capture := &deviceCapture{
 		rbuf:  rbuf.NewFixedSizeRingBuf(bufferSize * numChannels),
 		buf:   make([]byte, bufferSize*numChannels, bufferSize*numChannels),
-		bchan: make(chan byte),
-		q:     queue.New(),
-		mode:  1,
 		ready: make(chan struct{}),
 		more:  false,
 	}
@@ -296,29 +289,15 @@ func DeviceCapture(sr beep.SampleRate, device CaptureDeviceInfo, bufferSize int,
 	onCapSamples := func(pOutputSample, pInputSamples []byte, framecount uint32) {
 		byteCount := framecount * deviceConfig.Capture.Channels * uint32(malgo.SampleSizeInBytes(deviceConfig.Capture.Format))
 
-		if capture.mode == 1 {
-			_, err := capture.rbuf.WriteAndMaybeOverwriteOldestData(pInputSamples[:byteCount])
-			if err != nil {
-				panic(err)
-			}
-			if capture.more {
-				capture.more = false
-				capture.ready <- struct{}{}
-			}
-		} else if capture.mode == 2 {
-			for i := uint32(0); i < byteCount; i++ {
-				capture.bchan <- pInputSamples[i]
-			}
-		} else if capture.mode == 3 {
-			for _, b := range pInputSamples {
-				capture.q.Append(b)
-			}
+		_, err := capture.rbuf.WriteAndMaybeOverwriteOldestData(pInputSamples[:byteCount])
+		if err != nil {
+			log.Println("got an error writing to rbuf: ", err)
+			log.Println("TODO: add recovery here: reset rbuf and try again...")
 		}
-		// if len(buf) < int(byteCount) {
-		// 	update()
-		// }
-		// copy(pOutputSample, buf[:byteCount])
-		// buf = append([]byte{}, buf[byteCount:]...)
+		if capture.more {
+			capture.more = false
+			capture.ready <- struct{}{}
+		}
 	}
 
 	deviceCallbacks := malgo.DeviceCallbacks{
@@ -342,105 +321,33 @@ func DeviceCapture(sr beep.SampleRate, device CaptureDeviceInfo, bufferSize int,
 }
 
 func (g *deviceCapture) Stream(samples [][2]float64) (n int, ok bool) {
-	if g.mode == 1 {
-		samplesSize := int(g.device.CaptureChannels()) * len(samples) * malgo.SampleSizeInBytes(g.device.CaptureFormat())
-		buf := make([]byte, samplesSize, samplesSize)
+	samplesSize := int(g.device.CaptureChannels()) * len(samples) * malgo.SampleSizeInBytes(g.device.CaptureFormat())
+	buf := make([]byte, samplesSize, samplesSize)
 
-		if g.rbuf.Avail() == 0 {
-			g.more = true
-			<-g.ready
-		}
+	// if there is not enough data in the buffer let the writer know and wait for signal...
+	if g.rbuf.Avail() == 0 {
+		g.more = true
+		<-g.ready
+	}
 
-		// log.Println("rbuf available:", avail)
-		var err error
-		var readCount int
-		// for {
-		// 	readCount, err = g.rbuf.ReadAndMaybeAdvance(buf, true)
-		// 	if err != nil {
-		// 		// panic(err)
-		// 		// log.Println(err)
-		// 	}
-		// 	if readCount == 0 {
-		// 		// log.Println("read count from rbuf is 0!!")
-		// 		g.more = true
-		// 		<-g.ready
-		// 		// log.Println("got more")
-		// 		continue
-		// 	}
-		// 	break
-		// }
-		readCount, err = g.rbuf.ReadAndMaybeAdvance(buf, true)
-		if err != nil {
-			// panic(err)
-			log.Println(err)
-		}
+	readCount, err := g.rbuf.ReadAndMaybeAdvance(buf, true)
+	if err != nil {
+		log.Println("error in rbuf read and maybe advance:", err)
+		log.Println("TODO: figure out how to recover from this case")
+		log.Fatalln("ouch")
+	}
 
-		sampleLen := len(samples)
-		count := sampleLen
-		actLen := sampleLen
-		if readCount < sampleLen {
-			actLen = readCount
-			count = readCount
-		}
-		if g.device.CaptureChannels() == 1 {
-			for i := range samples {
-				e1 := buf[i*2]
-				e2 := buf[i*2+1]
-				val := float64(int16(e1)+int16(e2)*(1<<8)) / (1<<16 - 1)
-				samples[i][0] = val
-				samples[i][1] = val
-				count -= 1
-				if count == 0 {
-					break
-				}
-			}
-			return actLen, true
-		} else if g.device.CaptureChannels() == 2 {
-			for i := range samples {
-				e1 := buf[i*4]
-				e2 := buf[i*4+1]
-				e3 := buf[i*4+1]
-				e4 := buf[i*4+1]
-				val1 := float64(int16(e1)+int16(e2)*(1<<8)) / (1<<16 - 1)
-				val2 := float64(int16(e3)+int16(e4)*(1<<8)) / (1<<16 - 1)
-				samples[i][0] = val1
-				samples[i][1] = val2
-				count -= 1
-				if count == 0 {
-					break
-				}
-			}
-			return actLen, true
-		}
-	} else if g.mode == 2 {
+	sampleLen := len(samples)
+	count := sampleLen
+	actLen := sampleLen
+	if readCount < sampleLen {
+		actLen = readCount
+		count = readCount
+	}
+	if g.device.CaptureChannels() == 1 {
 		for i := range samples {
-			e1 := <-g.bchan
-			e2 := <-g.bchan
-			val := float64(int16(e1)+int16(e2)*(1<<8)) / (1<<16 - 1)
-			samples[i][0] = val
-			samples[i][1] = val
-		}
-		return len(samples), true
-	} else if g.mode == 3 {
-		samplesLen := len(samples)
-		// fmt.Println("in custom class streamer cons func", samplesLen)
-		count := samplesLen
-		dataLen := 0
-		dataLen = g.q.Length()
-		actLen := samplesLen
-		if dataLen < samplesLen {
-			// fmt.Println("not enough data ready", dataLen)
-			if dataLen == 0 {
-				fmt.Printf("not enough %d of %d\n", dataLen, samplesLen)
-				return 0, true
-			}
-			count = dataLen
-			actLen = dataLen
-		}
-		for i := range samples {
-			var e1, e2 byte
-			e1 = g.q.Pop().(uint8)
-			e2 = g.q.Pop().(uint8)
+			e1 := buf[i*2]
+			e2 := buf[i*2+1]
 			val := float64(int16(e1)+int16(e2)*(1<<8)) / (1<<16 - 1)
 			samples[i][0] = val
 			samples[i][1] = val
@@ -448,23 +355,24 @@ func (g *deviceCapture) Stream(samples [][2]float64) (n int, ok bool) {
 			if count == 0 {
 				break
 			}
-			// fmt.Println("return", actLen)
-			return actLen, true
+		}
+	} else if g.device.CaptureChannels() == 2 {
+		for i := range samples {
+			e1 := buf[i*4]
+			e2 := buf[i*4+1]
+			e3 := buf[i*4+1]
+			e4 := buf[i*4+1]
+			val1 := float64(int16(e1)+int16(e2)*(1<<8)) / (1<<16 - 1)
+			val2 := float64(int16(e3)+int16(e4)*(1<<8)) / (1<<16 - 1)
+			samples[i][0] = val1
+			samples[i][1] = val2
+			count -= 1
+			if count == 0 {
+				break
+			}
 		}
 	}
-	// for i := range samples {
-	// 	// if g.t < 0.5 {
-	// 	// 	samples[i][0] = 2.0*(1-g.t) - 1
-	// 	// 	samples[i][1] = 2.0*(1-g.t) - 1
-	// 	// } else {
-	// 	// 	samples[i][0] = 2.0*g.t - 1.0
-	// 	// 	samples[i][1] = 2.0*g.t - 1.0
-	// 	// }
-	// 	// _, g.t = math.Modf(g.t + g.dt)
-	// }
-
-	panic("we should not reach here!!")
-	return len(samples), true
+	return actLen, true
 }
 
 func (*deviceCapture) Err() error {

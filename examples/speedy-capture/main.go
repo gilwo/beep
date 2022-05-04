@@ -29,7 +29,7 @@ type audioPanel struct {
 }
 
 func newAudioPanel(sampleRate beep.SampleRate, streamer beep.Streamer) *audioPanel {
-	gain := &effects.Gain{Streamer: streamer, Gain: -1} // no gain  on start
+	gain := &effects.Gain{Streamer: streamer, Gain: 0} // normal on start
 	ctrl := &beep.Ctrl{Streamer: gain}
 	resampler := beep.ResampleRatio(4, 1, ctrl)
 	volume := &effects.Volume{Streamer: resampler, Base: 2}
@@ -56,22 +56,16 @@ func (ap *audioPanel) draw(screen tcell.Screen) {
 	drawTextLine(screen, 0, 3, "Use keys in (?/?) to turn the buttons.", mainStyle)
 
 	speaker.Lock()
-	position := ap.sampleRate.D(0) //ap.streamer.Position())
-	length := ap.sampleRate.D(0)   //ap.streamer.Len())
 	gain := ap.gain.Gain
 	volume := ap.volume.Volume
 	speed := ap.resampler.Ratio()
 	speaker.Unlock()
 
-	positionStatus := fmt.Sprintf("%v / %v", position.Round(time.Second), length.Round(time.Second))
 	gainStatus := fmt.Sprintf("%.1f", gain)
 	volumeStatus := fmt.Sprintf("%.1f", volume)
 	speedStatus := fmt.Sprintf("%.3fx", speed)
 
-	drawTextLine(screen, 0, 5, "Position (Q/W):", mainStyle)
-	drawTextLine(screen, 16, 5, positionStatus, statusStyle)
-
-	drawTextLine(screen, 0, 6, "Gain (E/R):", mainStyle)
+	drawTextLine(screen, 0, 6, "Gain     (Q/W):", mainStyle)
 	drawTextLine(screen, 16, 6, gainStatus, statusStyle)
 
 	drawTextLine(screen, 0, 7, "Volume   (A/S):", mainStyle)
@@ -99,34 +93,15 @@ func (ap *audioPanel) handle(event tcell.Event) (changed, quit bool) {
 			speaker.Unlock()
 			return false, false
 
-		case 'q', 'w':
+		case 'q':
 			speaker.Lock()
-			// newPos := ap.streamer.Position()
-			// if event.Rune() == 'q' {
-			// 	newPos -= ap.sampleRate.N(time.Second)
-			// }
-			// if event.Rune() == 'w' {
-			// 	newPos += ap.sampleRate.N(time.Second)
-			// }
-			// if newPos < 0 {
-			// 	newPos = 0
-			// }
-			// if newPos >= ap.streamer.Len() {
-			// 	newPos = ap.streamer.Len() - 1
-			// }
-			// if err := ap.streamer.Seek(newPos); err != nil {
-			// 	report(err)
-			// }
+			if ap.gain.Gain > 1 {
+				ap.gain.Gain -= 1.0
+			}
 			speaker.Unlock()
 			return true, false
 
-		case 'e':
-			speaker.Lock()
-			ap.gain.Gain -= 1.0
-			speaker.Unlock()
-			return true, false
-
-		case 'r':
+		case 'w':
 			speaker.Lock()
 			ap.gain.Gain += 1.0
 			speaker.Unlock()
@@ -161,33 +136,13 @@ func (ap *audioPanel) handle(event tcell.Event) (changed, quit bool) {
 }
 
 func main() {
-	// if len(os.Args) != 2 {
-	// 	fmt.Fprintf(os.Stderr, "Usage: %s song.mp3\n", os.Args[0])
-	// 	os.Exit(1)
-	// }
-	// f, err := os.Open(os.Args[1])
-	// if err != nil {
-	// 	report(err)
-	// }
-	// streamer, format, err := mp3.Decode(f)
-	// if err != nil {
-	// 	report(err)
-	// }
-	// defer streamer.Close()
 	sr := beep.SampleRate(44000)
-	streamer, _ := speaker.DeviceCapture(sr, speaker.DefaultCaptureDevice(), sr.N(time.Second/2), 2)
+	streamer, err := speaker.DeviceCapture(sr, speaker.DefaultCaptureDevice(), sr.N(time.Second/10), 2)
+	if err != nil {
+		panic(err)
+	}
 
 	speaker.Init(sr, sr.N(time.Second/30))
-	// speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/30))
-	// speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/30),
-	// 	func(list []speaker.SpeakerDevice) *speaker.SpeakerDevice {
-	// 		fmt.Printf("device list\n")
-	// 		for i, d := range list {
-	// 			fmt.Printf("%d: %s\n", i, d.Name)
-	// 		}
-	// 		// return &list[0]
-	// 		return nil
-	// 	})
 
 	screen, err := tcell.NewScreen()
 	if err != nil {
